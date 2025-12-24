@@ -1,171 +1,158 @@
 """
-Professional LLM Handler for MedGPT
-Supports: Groq (Primary), with intelligent fallback
+LLM Handler for MedGPT
+OpenRouter (primary) with streaming + graceful fallback
 """
 
 import os
-from typing import Optional, Dict
+from typing import Dict, Generator, Optional
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
 
 class LLMHandler:
-    """Enterprise-grade LLM handler with Groq API"""
-    
+    """Handles LLM calls via OpenRouter with streaming and fallback."""
     def __init__(self):
         self.backend = "fallback"
-        self.model_name = "Context Extractor"
-        self.groq_client = None
+        self.model_name = "Context Extractor (fallback)"
+        self.client: Optional[OpenAI] = None
         self.error = None
+        # Llama 3.1 70B Instruct on OpenRouter
+        self.model_id = "meta-llama/llama-3.1-70b-instruct"
         self._initialize()
-    
+
     def _initialize(self):
-        """Initialize Groq with proper error handling"""
-        groq_key = os.getenv("GROQ_API_KEY")
-        
-        if not groq_key:
-            self.error = "GROQ_API_KEY not found in environment"
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            self.error = "OPENROUTER_API_KEY not found in .env"
             print(f"⚠️ {self.error}")
             return
-        
+
         try:
-            from groq import Groq
-            
-            self.groq_client = Groq(api_key=groq_key)
-            
-            # Test connection with minimal token usage
-            response = self.groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": "test"}],
-                max_tokens=5,
-                timeout=10
+            # OpenRouter recommends these headers when possible.
+            self.client = OpenAI(
+                api_key=api_key,
+                base_url="https://openrouter.ai/api/v1",
+                default_headers={
+                    "HTTP-Referer": os.getenv("APP_PUBLIC_URL", "http://localhost"),
+                    "X-Title": os.getenv("APP_TITLE", "MedGPT"),
+                },
             )
-            
-            self.backend = "groq"
-            self.model_name = "Llama 3.3 70B"
+
+            # Light ping to confirm credentials
+            _ = self.client.chat.completions.create(
+                model=self.model_id,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=5
+            )
+            self.backend = "openrouter"
+            self.model_name = "Llama 3.1 70B via OpenRouter"
             self.error = None
-            print("✅ Groq initialized successfully")
-            
-        except ImportError as e:
-            self.error = f"Groq library not installed: {e}"
-            print(f"❌ {self.error}")
+            print("✅ OpenRouter initialized successfully")
+
         except Exception as e:
-            self.error = f"Groq initialization failed: {str(e)}"
+            self.error = f"OpenRouter initialization failed: {e}"
             print(f"❌ {self.error}")
-    
-    def generate_answer(self, query: str, context: str, max_tokens: int = 1024) -> str:
-        """
-        Generate medical answer from context
-        
-        Args:
-            query: User's medical question
-            context: Retrieved context from vectorstore
-            max_tokens: Maximum response length
-            
-        Returns:
-            Generated answer
-        """
+
+    def _build_messages(self, query: str, context: str):
+        system_prompt = (
+            "You are MedGPT, a professional, evidence-based medical assistant. "
+            "Use ONLY the provided context. If the answer is unknown, say so. "
+            "Be concise and clear, suitable for clinicians and students."
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Context:\n{context[:8000]}\n\nQuestion: {query}"},
+        ]
+
+    def generate_answer(
+        self,
+        query: str,
+        context: str,
+        max_tokens: int = 1024,
+        temperature: float = 0.3,
+        top_p: float = 0.9,
+    ) -> str:
+        """Non-streaming completion (used if streaming not desired)."""
         if self.backend == "fallback":
             return self._fallback_answer(query, context)
-        
+
         try:
-            system_prompt = """You are MedGPT, a professional medical knowledge assistant.
-
-Your responsibilities:
-- Provide accurate, evidence-based medical information
-- Base all answers STRICTLY on the provided context
-- Use clear, professional medical terminology
-- Structure responses with proper paragraphs
-- Include relevant clinical details (dosages, protocols, criteria)
-- Cite specific information from the context
-- If context is insufficient, clearly state limitations
-
-CRITICAL: Never add information not present in the provided context."""
-
-            user_prompt = f"""Medical Context:
-{context[:4000]}
-
-Clinical Question: {query}
-
-Provide a comprehensive, evidence-based answer based ONLY on the context above."""
-
-            response = self.groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.3,
+            messages = self._build_messages(query, context)
+            response = self.client.chat.completions.create(
+                model=self.model_id,
+                messages=messages,
                 max_tokens=max_tokens,
-                top_p=0.9,
-                timeout=30
+                temperature=temperature,
+                top_p=top_p,
             )
-            
-            answer = response.choices[0].message.content.strip()
-            return answer if answer else "Unable to generate response."
-            
+            return (response.choices[0].message.content or "").strip() or "Unable to generate response."
         except Exception as e:
-            print(f"⚠️ Groq error: {e}")
+            print(f"⚠️ OpenRouter error: {e}")
             return self._fallback_answer(query, context)
-    
+
+    def stream_answer(
+        self,
+        query: str,
+        context: str,
+        max_tokens: int = 1024,
+        temperature: float = 0.3,
+        top_p: float = 0.9,
+    ) -> Generator[str, None, None]:
+        """Streaming generator yielding tokens progressively."""
+        if self.backend == "fallback":
+            yield self._fallback_answer(query, context)
+            return
+
+        try:
+            messages = self._build_messages(query, context)
+            stream = self.client.chat.completions.create(
+                model=self.model_id,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta and getattr(delta, "content", None):
+                    yield delta.content
+        except Exception as e:
+            print(f"⚠️ Streaming error: {e}")
+            yield self._fallback_answer(query, context)
+
     def _fallback_answer(self, query: str, context: str) -> str:
-        """
-        Intelligent fallback using keyword extraction
-        Used when Groq is unavailable
-        """
-        # Split into sentences
-        sentences = []
-        for line in context.split('\n'):
-            line = line.strip()
-            if len(line) > 50:  # Filter short fragments
-                for sent in line.split('. '):
-                    sent = sent.strip()
-                    if len(sent) > 50:
-                        sentences.append(sent if sent.endswith('.') else sent + '.')
-        
-        # Score sentences by query relevance
-        query_words = set(query.lower().split())
-        scored = []
-        
-        for sent in sentences[:30]:
-            sent_lower = sent.lower()
-            # Count matching keywords (min 4 chars)
-            score = sum(1 for word in query_words if len(word) >= 4 and word in sent_lower)
-            if score > 0:
-                scored.append((score, sent))
-        
-        # Sort by relevance and take top 4
+        """Very simple heuristic extraction from context if API is unavailable."""
+        sentences = [
+            (s.strip() + ".")
+            for line in context.split("\n")
+            if len(line.strip()) > 50
+            for s in line.split(". ")
+            if len(s.strip()) > 50
+        ]
+        q = set(query.lower().split())
+        scored = [
+            (sum(1 for w in q if len(w) >= 4 and w in s.lower()), s) for s in sentences
+        ]
+        scored = [(score, s) for score, s in scored if score > 0]
         scored.sort(reverse=True, key=lambda x: x[0])
-        top_sentences = [sent for _, sent in scored[:4]]
-        
-        if top_sentences:
-            answer = ' '.join(top_sentences)
-        else:
-            # Return first substantial content
-            answer = ' '.join(sentences[:3]) if sentences else context[:500]
-        
-        # Add notice
-        notice = f"""
+        top = [s for _, s in scored[:4]] or sentences[:3]
+        answer = " ".join(top) if top else (context[:500] or "No context available.")
 
----
-⚠️ **Fallback Mode Active**
-
-This response uses keyword extraction. For AI-enhanced answers:
-1. Go to Settings → Secrets in Streamlit Cloud
-2. Add: `GROQ_API_KEY = "your_groq_key"`
-3. Get free key at: https://console.groq.com
-
-Error: {self.error or 'API key not configured'}
-"""
-        
+        notice = (
+            "\n\n---\n"
+            "⚠️ **Fallback Mode Active**  \n"
+            "Add/repair `OPENROUTER_API_KEY` in `.env` to enable AI responses.\n"
+            f"Error: {self.error or 'API key not configured'}"
+        )
         return answer + notice
-    
+
     def get_status(self) -> Dict[str, str]:
-        """Get current backend status"""
         return {
             "backend": self.backend,
             "model": self.model_name,
             "ready": self.backend != "fallback",
-            "error": self.error
+            "error": self.error,
         }
