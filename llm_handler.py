@@ -5,6 +5,7 @@ Supports: OpenRouter with Llama 3.1 70B
 
 import os
 import requests
+import json
 from typing import Optional, Dict
 from dotenv import load_dotenv
 
@@ -58,13 +59,16 @@ class LLMHandler:
             self.error = f"OpenRouter initialization failed: {str(e)}"
             print(f"❌ {self.error}")
     
-    def generate_answer(self, query: str, context: str, max_tokens: int = 1024) -> str:
+    def generate_answer(self, query: str, context: str, temperature: float = 0.3,
+                       top_p: float = 0.9, max_tokens: int = 1024) -> str:
         """
         Generate medical answer from context
         
         Args:
             query: User's medical question
             context: Retrieved context from vectorstore
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
             max_tokens: Maximum response length
             
         Returns:
@@ -106,9 +110,9 @@ Provide a comprehensive, evidence-based answer based ONLY on the context above."
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt}
                     ],
-                    "temperature": 0.3,
+                    "temperature": temperature,
                     "max_tokens": max_tokens,
-                    "top_p": 0.9
+                    "top_p": top_p
                 },
                 timeout=30
             )
@@ -122,6 +126,88 @@ Provide a comprehensive, evidence-based answer based ONLY on the context above."
         except Exception as e:
             print(f"⚠️ OpenRouter error: {e}")
             return self._fallback_answer(query, context)
+    
+    def stream_answer(self, query: str, context: str, temperature: float = 0.3, 
+                     top_p: float = 0.9, max_tokens: int = 1024):
+        """
+        Stream the answer from OpenRouter
+        
+        Args:
+            query: User's medical question
+            context: Retrieved context from vectorstore
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            max_tokens: Maximum response length
+            
+        Yields:
+            Tokens as they arrive
+        """
+        if self.backend == "fallback":
+            # Fallback doesn't stream - just yield the whole answer
+            yield self._fallback_answer(query, context)
+            return
+        
+        try:
+            system_prompt = """You are MedGPT, a professional medical knowledge assistant.
+
+Your responsibilities:
+- Provide accurate, evidence-based medical information
+- Base all answers STRICTLY on the provided context
+- Use clear, professional medical terminology
+- Structure responses with proper paragraphs
+- Include relevant clinical details (dosages, protocols, criteria)
+- Cite specific information from the context
+- If context is insufficient, clearly state limitations
+
+CRITICAL: Never add information not present in the provided context."""
+
+            user_prompt = f"""Medical Context:
+{context[:4000]}
+
+Clinical Question: {query}
+
+Provide a comprehensive, evidence-based answer based ONLY on the context above."""
+
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "meta-llama/llama-3.1-70b-instruct",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "top_p": top_p,
+                    "stream": True
+                },
+                timeout=60,
+                stream=True
+            )
+            
+            for line in response.iter_lines():
+                if line:
+                    line_text = line.decode('utf-8')
+                    if line_text.startswith('data: '):
+                        if line_text.strip() == 'data: [DONE]':
+                            break
+                        try:
+                            data = json.loads(line_text[6:])
+                            if 'choices' in data and len(data['choices']) > 0:
+                                delta = data['choices'][0].get('delta', {})
+                                content = delta.get('content', '')
+                                if content:
+                                    yield content
+                        except json.JSONDecodeError:
+                            continue
+            
+        except Exception as e:
+            print(f"⚠️ OpenRouter streaming error: {e}")
+            yield self._fallback_answer(query, context)
     
     def _fallback_answer(self, query: str, context: str) -> str:
         """
