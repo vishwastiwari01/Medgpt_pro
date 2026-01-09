@@ -6,7 +6,6 @@ OpenRouter (primary) with streaming + graceful fallback
 import os
 from typing import Dict, Generator, Optional
 from dotenv import load_dotenv
-from openai import OpenAI
 
 load_dotenv()
 
